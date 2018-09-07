@@ -993,7 +993,7 @@ class RequestHandler(object):
                 future.set_result(None)
                 return future
 
-    def finish(self, chunk=None):
+    def finish(self, chunk=None, stop_execute=False):
         """Finishes this response, ending the HTTP request.
 
         Passing a ``chunk`` to ``finish()`` is equivalent to passing that
@@ -1008,6 +1008,9 @@ class RequestHandler(object):
 
            Now returns a `.Future` instead of ``None``.
         """
+        if stop_execute:
+            setattr(self, "stop_execute", True)
+
         if self._finished:
             raise RuntimeError("finish() called twice")
 
@@ -1531,7 +1534,13 @@ class RequestHandler(object):
 
     @gen.coroutine
     def _execute(self, transforms, *args, **kwargs):
-        """Executes this request with the given output transforms."""
+        """Executes this request with the given output transforms.
+
+        If attribute stop_execute is True,it will stop right now.
+        """
+        if getattr(self, "stop_execute", None):
+            return
+
         self._transforms = transforms
         try:
             if self.request.method not in self.SUPPORTED_METHODS:
