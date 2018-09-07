@@ -19,12 +19,10 @@ the same event loop.
    Windows. Use the `~asyncio.SelectorEventLoop` instead.
 """
 
-from __future__ import absolute_import, division, print_function
 import functools
 
 from tornado.gen import convert_yielded
 from tornado.ioloop import IOLoop
-from tornado import stack_context
 
 import asyncio
 
@@ -62,14 +60,19 @@ class BaseAsyncIOLoop(IOLoop):
             self.remove_handler(fd)
             if all_fds:
                 self.close_fd(fileobj)
-        self.asyncio_loop.close()
+        # Remove the mapping before closing the asyncio loop. If this
+        # happened in the other order, we could race against another
+        # initialize() call which would see the closed asyncio loop,
+        # assume it was closed from the asyncio side, and do this
+        # cleanup for us, leading to a KeyError.
         del IOLoop._ioloop_for_asyncio[self.asyncio_loop]
+        self.asyncio_loop.close()
 
     def add_handler(self, fd, handler, events):
         fd, fileobj = self.split_fd(fd)
         if fd in self.handlers:
             raise ValueError("fd %s added twice" % fd)
-        self.handlers[fd] = (fileobj, stack_context.wrap(handler))
+        self.handlers[fd] = (fileobj, handler)
         if events & IOLoop.READ:
             self.asyncio_loop.add_reader(
                 fd, self._handle_events, fd, IOLoop.READ)
@@ -137,7 +140,7 @@ class BaseAsyncIOLoop(IOLoop):
         # convert from absolute to relative.
         return self.asyncio_loop.call_later(
             max(0, when - self.time()), self._run_callback,
-            functools.partial(stack_context.wrap(callback), *args, **kwargs))
+            functools.partial(callback, *args, **kwargs))
 
     def remove_timeout(self, timeout):
         timeout.cancel()
@@ -146,7 +149,7 @@ class BaseAsyncIOLoop(IOLoop):
         try:
             self.asyncio_loop.call_soon_threadsafe(
                 self._run_callback,
-                functools.partial(stack_context.wrap(callback), *args, **kwargs))
+                functools.partial(callback, *args, **kwargs))
         except RuntimeError:
             # "Event loop is closed". Swallow the exception for
             # consistency with PollIOLoop (and logical consistency
@@ -265,7 +268,7 @@ def to_asyncio_future(tornado_future):
     return convert_yielded(tornado_future)
 
 
-class AnyThreadEventLoopPolicy(asyncio.DefaultEventLoopPolicy):
+class AnyThreadEventLoopPolicy(asyncio.DefaultEventLoopPolicy):  # type: ignore
     """Event loop policy that allows loop creation on any thread.
 
     The default `asyncio` event loop policy only automatically creates

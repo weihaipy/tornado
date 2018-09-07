@@ -91,10 +91,7 @@ instances to define isolated sets of options, such as for subcommands.
    options can be defined, set, and read with any mix of the two.
    Dashes are typical for command-line usage while config files require
    underscores.
-
 """
-
-from __future__ import absolute_import, division, print_function
 
 import datetime
 import numbers
@@ -105,7 +102,6 @@ import textwrap
 
 from tornado.escape import _unicode, native_str
 from tornado.log import define_logging_options
-from tornado import stack_context
 from tornado.util import basestring_type, exec_in
 
 
@@ -326,18 +322,20 @@ class OptionParser(object):
         the global namespace that matches a defined option will be
         used to set that option's value.
 
-        Options are not parsed from strings as they would be on the
-        command line; they should be set to the correct type (this
-        means if you have ``datetime`` or ``timedelta`` options you
-        will need to import those modules in the config file.
+        Options may either be the specified type for the option or
+        strings (in which case they will be parsed the same way as in
+        `.parse_command_line`)
 
         Example (using the options defined in the top-level docs of
         this module)::
 
             port = 80
             mysql_host = 'mydb.example.com:3306'
+            # Both lists and comma-separated strings are allowed for
+            # multiple=True.
             memcache_hosts = ['cache1.example.com:11011',
                               'cache2.example.com:11011']
+            memcache_hosts = 'cache1.example.com:11011,cache2.example.com:11011'
 
         If ``final`` is ``False``, parse callbacks will not be run.
         This is useful for applications that wish to combine configurations
@@ -358,6 +356,9 @@ class OptionParser(object):
            The special variable ``__file__`` is available inside config
            files, specifying the absolute path to the config file itself.
 
+        .. versionchanged:: 5.1
+           Added the ability to set options via strings in config files.
+
         """
         config = {'__file__': os.path.abspath(path)}
         with open(path, 'rb') as f:
@@ -365,7 +366,17 @@ class OptionParser(object):
         for name in config:
             normalized = self._normalize_name(name)
             if normalized in self._options:
-                self._options[normalized].set(config[name])
+                option = self._options[normalized]
+                if option.multiple:
+                    if not isinstance(config[name], (list, str)):
+                        raise Error("Option %r is required to be a list of %s "
+                                    "or a comma-separated string" %
+                                    (option.name, option.type.__name__))
+
+                if type(config[name]) == str and option.type != str:
+                    option.parse(config[name])
+                else:
+                    option.set(config[name])
 
         if final:
             self.run_parse_callbacks()
@@ -407,7 +418,7 @@ class OptionParser(object):
 
     def add_parse_callback(self, callback):
         """Adds a parse callback, to be invoked when option parsing is done."""
-        self._parse_callbacks.append(stack_context.wrap(callback))
+        self._parse_callbacks.append(callback)
 
     def run_parse_callbacks(self):
         for callback in self._parse_callbacks:

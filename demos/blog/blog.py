@@ -130,7 +130,8 @@ class BaseHandler(tornado.web.RequestHandler):
         # self.current_user in prepare instead.
         user_id = self.get_secure_cookie("blogdemo_user")
         if user_id:
-            self.current_user = await self.queryone("SELECT * FROM authors WHERE id = %s", int(user_id))
+            self.current_user = await self.queryone("SELECT * FROM authors WHERE id = %s",
+                                                    int(user_id))
 
     async def any_author_exists(self):
         return bool(await self.query("SELECT * FROM authors LIMIT 1"))
@@ -172,7 +173,7 @@ class ComposeHandler(BaseHandler):
         id = self.get_argument("id", None)
         entry = None
         if id:
-            entry = await self.query("SELECT * FROM entries WHERE id = %s", int(id))
+            entry = await self.queryone("SELECT * FROM entries WHERE id = %s", int(id))
         self.render("compose.html", entry=entry)
 
     @tornado.web.authenticated
@@ -182,8 +183,9 @@ class ComposeHandler(BaseHandler):
         text = self.get_argument("markdown")
         html = markdown.markdown(text)
         if id:
-            entry = await self.query("SELECT * FROM entries WHERE id = %s", int(id))
-            if not entry:
+            try:
+                entry = await self.queryone("SELECT * FROM entries WHERE id = %s", int(id))
+            except NoResultError:
                 raise tornado.web.HTTPError(404)
             slug = entry.slug
             await self.execute(

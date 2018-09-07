@@ -1,13 +1,14 @@
-from __future__ import absolute_import, division, print_function
-
+# -*- coding: utf-8 -*-
 import base64
 import binascii
 from contextlib import closing
 import copy
-import sys
 import threading
 import datetime
 from io import BytesIO
+import time
+import unicodedata
+import unittest
 
 from tornado.escape import utf8, native_str
 from tornado import gen
@@ -17,9 +18,8 @@ from tornado.ioloop import IOLoop
 from tornado.iostream import IOStream
 from tornado.log import gen_log
 from tornado import netutil
-from tornado.stack_context import ExceptionStackContext, NullContext
 from tornado.testing import AsyncHTTPTestCase, bind_unused_port, gen_test, ExpectLog
-from tornado.test.util import unittest, skipOnTravis, ignore_deprecation
+from tornado.test.util import skipOnTravis
 from tornado.web import Application, RequestHandler, url
 from tornado.httputil import format_timestamp, HTTPHeaders
 
@@ -103,7 +103,7 @@ class PatchHandler(RequestHandler):
 
 
 class AllMethodsHandler(RequestHandler):
-    SUPPORTED_METHODS = RequestHandler.SUPPORTED_METHODS + ('OTHER',)
+    SUPPORTED_METHODS = RequestHandler.SUPPORTED_METHODS + ('OTHER',)  # type: ignore
 
     def method(self):
         self.write(self.request.method)
@@ -215,28 +215,8 @@ Transfer-Encoding: chunked
             self.assertEqual(resp.body, b"12")
             self.io_loop.remove_handler(sock.fileno())
 
-    def test_streaming_stack_context(self):
-        chunks = []
-        exc_info = []
-
-        def error_handler(typ, value, tb):
-            exc_info.append((typ, value, tb))
-            return True
-
-        def streaming_cb(chunk):
-            chunks.append(chunk)
-            if chunk == b'qwer':
-                1 / 0
-
-        with ignore_deprecation():
-            with ExceptionStackContext(error_handler):
-                self.fetch('/chunk', streaming_callback=streaming_cb)
-
-        self.assertEqual(chunks, [b'asdf', b'qwer'])
-        self.assertEqual(1, len(exc_info))
-        self.assertIs(exc_info[0][0], ZeroDivisionError)
-
     def test_basic_auth(self):
+        # This test data appears in section 2 of RFC 7617.
         self.assertEqual(self.fetch("/auth", auth_username="Aladdin",
                                     auth_password="open sesame").body,
                          b"Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==")
@@ -246,6 +226,20 @@ Transfer-Encoding: chunked
                                     auth_password="open sesame",
                                     auth_mode="basic").body,
                          b"Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==")
+
+    def test_basic_auth_unicode(self):
+        # This test data appears in section 2.1 of RFC 7617.
+        self.assertEqual(self.fetch("/auth", auth_username="test",
+                                    auth_password="123£").body,
+                         b"Basic dGVzdDoxMjPCow==")
+
+        # The standard mandates NFC. Give it a decomposed username
+        # and ensure it is normalized to composed form.
+        username = unicodedata.normalize("NFD", u"josé")
+        self.assertEqual(self.fetch("/auth",
+                                    auth_username=username,
+                                    auth_password="səcrət").body,
+                         b"Basic am9zw6k6c8mZY3LJmXQ=")
 
     def test_unsupported_auth_mode(self):
         # curl and simple clients handle errors a bit differently; the
@@ -334,23 +328,6 @@ Transfer-Encoding: chunked
         self.assertRegexpMatches(first_line[0], 'HTTP/[0-9]\\.[0-9] 200.*\r\n')
         self.assertEqual(chunks, [b'asdf', b'qwer'])
 
-    def test_header_callback_stack_context(self):
-        exc_info = []
-
-        def error_handler(typ, value, tb):
-            exc_info.append((typ, value, tb))
-            return True
-
-        def header_callback(header_line):
-            if header_line.lower().startswith('content-type:'):
-                1 / 0
-
-        with ignore_deprecation():
-            with ExceptionStackContext(error_handler):
-                self.fetch('/chunk', header_callback=header_callback)
-        self.assertEqual(len(exc_info), 1)
-        self.assertIs(exc_info[0][0], ZeroDivisionError)
-
     @gen_test
     def test_configure_defaults(self):
         defaults = dict(user_agent='TestDefaultUserAgent', allow_ipv6=False)
@@ -411,28 +388,6 @@ X-XSS-Protection: 1;
         response = self.fetch('/304_with_content_length')
         self.assertEqual(response.code, 304)
         self.assertEqual(response.headers['Content-Length'], '42')
-
-    def test_final_callback_stack_context(self):
-        # The final callback should be run outside of the httpclient's
-        # stack_context.  We want to ensure that there is not stack_context
-        # between the user's callback and the IOLoop, so monkey-patch
-        # IOLoop.handle_callback_exception and disable the test harness's
-        # context with a NullContext.
-        # Note that this does not apply to secondary callbacks (header
-        # and streaming_callback), as errors there must be seen as errors
-        # by the http client so it can clean up the connection.
-        exc_info = []
-
-        def handle_callback_exception(callback):
-            exc_info.append(sys.exc_info())
-            self.stop()
-        self.io_loop.handle_callback_exception = handle_callback_exception
-        with NullContext():
-            with ignore_deprecation():
-                self.http_client.fetch(self.get_url('/hello'),
-                                       lambda response: 1 / 0)
-        self.wait()
-        self.assertEqual(exc_info[0][0], ZeroDivisionError)
 
     @gen_test
     def test_future_interface(self):
@@ -529,6 +484,22 @@ X-XSS-Protection: 1;
         response.rethrow()
         self.assertEqual(response.headers["Foo"], native_str(u"\u00e9"))
 
+    def test_response_times(self):
+        # A few simple sanity checks of the response time fields to
+        # make sure they're using the right basis (between the
+        # wall-time and monotonic clocks).
+        start_time = time.time()
+        response = self.fetch("/hello")
+        response.rethrow()
+        self.assertGreaterEqual(response.request_time, 0)
+        self.assertLess(response.request_time, 1.0)
+        # A very crude check to make sure that start_time is based on
+        # wall time and not the monotonic clock.
+        self.assertLess(abs(response.start_time - start_time), 1.0)
+
+        for k, v in response.time_info.items():
+            self.assertTrue(0 <= v < 1.0, "time_info[%s] out of bounds: %s" % (k, v))
+
 
 class RequestProxyTest(unittest.TestCase):
     def test_request_set(self):
@@ -575,11 +546,6 @@ class HTTPResponseTestCase(unittest.TestCase):
 
 class SyncHTTPClientTest(unittest.TestCase):
     def setUp(self):
-        if IOLoop.configured_class().__name__ == 'TwistedIOLoop':
-            # TwistedIOLoop only supports the global reactor, so we can't have
-            # separate IOLoops for client and server threads.
-            raise unittest.SkipTest(
-                'Sync HTTPClient not compatible with TwistedIOLoop')
         self.server_ioloop = IOLoop()
 
         @gen.coroutine

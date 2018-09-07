@@ -175,8 +175,6 @@ For more information on application-level routing see docs for `~.web.Applicatio
 
 """
 
-from __future__ import absolute_import, division, print_function
-
 import re
 from functools import partial
 
@@ -375,7 +373,7 @@ class ReversibleRuleRouter(ReversibleRouter, RuleRouter):
     """
 
     def __init__(self, rules=None):
-        self.named_rules = {}  # type: typing.Dict[str]
+        self.named_rules = {}  # type: typing.Dict[str, Any]
         super(ReversibleRuleRouter, self).__init__(rules)
 
     def process_rule(self, rule):

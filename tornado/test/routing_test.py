@@ -10,14 +10,13 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-
-from __future__ import absolute_import, division, print_function
-
 from tornado.httputil import HTTPHeaders, HTTPMessageDelegate, HTTPServerConnectionDelegate, ResponseStartLine  # noqa: E501
 from tornado.routing import HostMatches, PathMatches, ReversibleRouter, Router, Rule, RuleRouter
 from tornado.testing import AsyncHTTPTestCase
 from tornado.web import Application, HTTPError, RequestHandler
 from tornado.wsgi import WSGIContainer
+
+import typing  # noqa
 
 
 class BasicRouter(Router):
@@ -47,7 +46,7 @@ class BasicRouterTestCase(AsyncHTTPTestCase):
         self.assertEqual(response.body, b"OK")
 
 
-resources = {}
+resources = {}  # type: typing.Dict[str, bytes]
 
 
 class GetResource(RequestHandler):

@@ -1,6 +1,4 @@
-from __future__ import absolute_import, division, print_function
-
-from tornado.escape import utf8, _unicode
+from tornado.escape import _unicode
 from tornado import gen
 from tornado.httpclient import HTTPResponse, HTTPError, AsyncHTTPClient, main, _RequestProxy
 from tornado import httputil
@@ -9,9 +7,7 @@ from tornado.ioloop import IOLoop
 from tornado.iostream import StreamClosedError
 from tornado.netutil import Resolver, OverrideResolver, _client_ssl_defaults
 from tornado.log import gen_log
-from tornado import stack_context
 from tornado.tcpclient import TCPClient
-from tornado.util import PY3
 
 import base64
 import collections
@@ -19,20 +15,11 @@ import copy
 import functools
 import re
 import socket
+import ssl
 import sys
+import time
 from io import BytesIO
-
-
-if PY3:
-    import urllib.parse as urlparse
-else:
-    import urlparse
-
-try:
-    import ssl
-except ImportError:
-    # ssl is not available on Google App Engine.
-    ssl = None
+import urllib.parse
 
 
 class HTTPTimeoutError(HTTPError):
@@ -158,15 +145,14 @@ class SimpleAsyncHTTPClient(AsyncHTTPClient):
                               len(self.active), len(self.queue)))
 
     def _process_queue(self):
-        with stack_context.NullContext():
-            while self.queue and len(self.active) < self.max_clients:
-                key, request, callback = self.queue.popleft()
-                if key not in self.waiting:
-                    continue
-                self._remove_timeout(key)
-                self.active[key] = (request, callback)
-                release_callback = functools.partial(self._release_fetch, key)
-                self._handle_request(request, release_callback, callback)
+        while self.queue and len(self.active) < self.max_clients:
+            key, request, callback = self.queue.popleft()
+            if key not in self.waiting:
+                continue
+            self._remove_timeout(key)
+            self.active[key] = (request, callback)
+            release_callback = functools.partial(self._release_fetch, key)
+            self._handle_request(request, release_callback, callback)
 
     def _connection_class(self):
         return _HTTPConnection
@@ -215,6 +201,7 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
                  max_header_size, max_body_size):
         self.io_loop = IOLoop.current()
         self.start_time = self.io_loop.time()
+        self.start_wall_time = time.time()
         self.client = client
         self.request = request
         self.release_callback = release_callback
@@ -235,7 +222,7 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
     @gen.coroutine
     def run(self):
         try:
-            self.parsed = urlparse.urlsplit(_unicode(self.request.url))
+            self.parsed = urllib.parse.urlsplit(_unicode(self.request.url))
             if self.parsed.scheme not in ("http", "https"):
                 raise ValueError("Unsupported url scheme: %s" %
                                  self.request.url)
@@ -263,7 +250,7 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
             if timeout:
                 self._timeout = self.io_loop.add_timeout(
                     self.start_time + timeout,
-                    stack_context.wrap(functools.partial(self._on_timeout, "while connecting")))
+                    functools.partial(self._on_timeout, "while connecting"))
                 stream = yield self.tcp_client.connect(
                     host, port, af=af,
                     ssl_options=ssl_options,
@@ -281,7 +268,7 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
                 if self.request.request_timeout:
                     self._timeout = self.io_loop.add_timeout(
                         self.start_time + self.request.request_timeout,
-                        stack_context.wrap(functools.partial(self._on_timeout, "during request")))
+                        functools.partial(self._on_timeout, "during request"))
                 if (self.request.method not in self._SUPPORTED_METHODS and
                         not self.request.allow_nonstandard_methods):
                     raise KeyError("unknown method %s" % self.request.method)
@@ -308,9 +295,9 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
                     if self.request.auth_mode not in (None, "basic"):
                         raise ValueError("unsupported auth_mode %s",
                                          self.request.auth_mode)
-                    auth = utf8(username) + b":" + utf8(password)
-                    self.request.headers["Authorization"] = (b"Basic " +
-                                                             base64.b64encode(auth))
+                    self.request.headers["Authorization"] = (
+                        b"Basic " + base64.b64encode(
+                            httputil.encode_username_password(username, password)))
                 if self.request.user_agent:
                     self.request.headers["User-Agent"] = self.request.user_agent
                 if not self.request.allow_nonstandard_methods:
@@ -447,6 +434,7 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
                     value = value.real_error
             self._run_callback(HTTPResponse(self.request, 599, error=value,
                                             request_time=self.io_loop.time() - self.start_time,
+                                            start_time=self.start_wall_time,
                                             ))
 
             if hasattr(self, "stream"):
@@ -503,8 +491,8 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
         if self._should_follow_redirect():
             assert isinstance(self.request, _RequestProxy)
             new_request = copy.copy(self.request.request)
-            new_request.url = urlparse.urljoin(self.request.url,
-                                               self.headers["Location"])
+            new_request.url = urllib.parse.urljoin(self.request.url,
+                                                   self.headers["Location"])
             new_request.max_redirects = self.request.max_redirects - 1
             del new_request.headers["Host"]
             # http://www.w3.org/Protocols/rfc2616/rfc2616-sec10.html#sec10.3.4
@@ -539,6 +527,7 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
                                 self.code, reason=getattr(self, 'reason', None),
                                 headers=self.headers,
                                 request_time=self.io_loop.time() - self.start_time,
+                                start_time=self.start_wall_time,
                                 buffer=buffer,
                                 effective_url=self.request.url)
         self._run_callback(response)

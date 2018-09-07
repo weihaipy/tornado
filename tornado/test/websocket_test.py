@@ -1,8 +1,6 @@
-from __future__ import absolute_import, division, print_function
-
 import functools
-import sys
 import traceback
+import unittest
 
 from tornado.concurrent import Future
 from tornado import gen
@@ -12,7 +10,6 @@ from tornado.log import gen_log, app_log
 from tornado.simple_httpclient import SimpleAsyncHTTPClient
 from tornado.template import DictLoader
 from tornado.testing import AsyncHTTPTestCase, gen_test, bind_unused_port, ExpectLog
-from tornado.test.util import unittest, skipBefore35, exec_test
 from tornado.web import Application, RequestHandler
 
 try:
@@ -33,7 +30,7 @@ from tornado.websocket import (
 try:
     from tornado import speedups
 except ImportError:
-    speedups = None
+    speedups = None  # type: ignore
 
 
 class TestWebSocketHandler(WebSocketHandler):
@@ -512,8 +509,6 @@ class WebSocketTest(WebSocketBaseTestCase):
         yield self.close(ws)
 
 
-if sys.version_info >= (3, 5):
-    NativeCoroutineOnMessageHandler = exec_test(globals(), locals(), """
 class NativeCoroutineOnMessageHandler(TestWebSocketHandler):
     def initialize(self, close_future, compression_options=None):
         super().initialize(close_future, compression_options)
@@ -525,7 +520,7 @@ class NativeCoroutineOnMessageHandler(TestWebSocketHandler):
         self.sleeping += 1
         await gen.sleep(0.01)
         self.sleeping -= 1
-        self.write_message(message)""")['NativeCoroutineOnMessageHandler']
+        self.write_message(message)
 
 
 class WebSocketNativeCoroutineTest(WebSocketBaseTestCase):
@@ -535,7 +530,6 @@ class WebSocketNativeCoroutineTest(WebSocketBaseTestCase):
             ('/native', NativeCoroutineOnMessageHandler,
              dict(close_future=self.close_future))])
 
-    @skipBefore35
     @gen_test
     def test_native_coroutine(self):
         ws = yield self.ws_connect('/native')
@@ -553,8 +547,20 @@ class CompressionTestMixin(object):
 
     def get_app(self):
         self.close_future = Future()
+
+        class LimitedHandler(TestWebSocketHandler):
+            @property
+            def max_message_size(self):
+                return 1024
+
+            def on_message(self, message):
+                self.write_message(str(len(message)))
+
         return Application([
             ('/echo', EchoHandler, dict(
+                close_future=self.close_future,
+                compression_options=self.get_server_compression_options())),
+            ('/limited', LimitedHandler, dict(
                 close_future=self.close_future,
                 compression_options=self.get_server_compression_options())),
         ])
@@ -580,6 +586,22 @@ class CompressionTestMixin(object):
         self.assertEqual(ws.protocol._message_bytes_in, len(self.MESSAGE) * 3)
         self.verify_wire_bytes(ws.protocol._wire_bytes_in,
                                ws.protocol._wire_bytes_out)
+        yield self.close(ws)
+
+    @gen_test
+    def test_size_limit(self):
+        ws = yield self.ws_connect(
+            '/limited',
+            compression_options=self.get_client_compression_options())
+        # Small messages pass through.
+        ws.write_message('a' * 128)
+        response = yield ws.read_message()
+        self.assertEqual(response, '128')
+        # This message is too big after decompression, but it compresses
+        # down to a size that will pass the initial checks.
+        ws.write_message('a' * 2048)
+        response = yield ws.read_message()
+        self.assertIsNone(response)
         yield self.close(ws)
 
 

@@ -12,8 +12,6 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-from __future__ import absolute_import, division, print_function
-
 import collections
 from concurrent.futures import CancelledError
 
@@ -459,7 +457,7 @@ class Lock(object):
     A Lock can be used as an async context manager with the ``async
     with`` statement:
 
-    >>> from tornado import gen, locks
+    >>> from tornado import locks
     >>> lock = locks.Lock()
     >>>
     >>> async def f():

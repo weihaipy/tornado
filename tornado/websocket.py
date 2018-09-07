@@ -16,8 +16,6 @@ the protocol (known as "draft 76") and are not compatible with this module.
    Removed support for the draft 76 protocol version.
 """
 
-from __future__ import absolute_import, division, print_function
-
 import base64
 import hashlib
 import os
@@ -25,6 +23,7 @@ import sys
 import struct
 import tornado.escape
 import tornado.web
+from urllib.parse import urlparse
 import zlib
 
 from tornado.concurrent import Future, future_set_result_unless_cancelled
@@ -32,17 +31,13 @@ from tornado.escape import utf8, native_str, to_unicode
 from tornado import gen, httpclient, httputil
 from tornado.ioloop import IOLoop, PeriodicCallback
 from tornado.iostream import StreamClosedError
-from tornado.log import gen_log, app_log
+from tornado.log import gen_log
 from tornado import simple_httpclient
 from tornado.queues import Queue
 from tornado.tcpclient import TCPClient
-from tornado.util import _websocket_mask, PY3
+from tornado.util import _websocket_mask
 
-if PY3:
-    from urllib.parse import urlparse  # py2
-    xrange = range
-else:
-    from urlparse import urlparse  # py3
+_default_max_message_size = 10 * 1024 * 1024
 
 
 class WebSocketError(Exception):
@@ -54,6 +49,10 @@ class WebSocketClosedError(WebSocketError):
 
     .. versionadded:: 3.2
     """
+    pass
+
+
+class _DecompressTooLargeError(Exception):
     pass
 
 
@@ -225,7 +224,7 @@ class WebSocketHandler(tornado.web.RequestHandler):
 
         Default is 10MiB.
         """
-        return self.settings.get('websocket_max_message_size', None)
+        return self.settings.get('websocket_max_message_size', _default_max_message_size)
 
     def write_message(self, message, binary=False):
         """Sends the given message to the client of this Web Socket.
@@ -249,7 +248,7 @@ class WebSocketHandler(tornado.web.RequestHandler):
            Consistently raises `WebSocketClosedError`. Previously could
            sometimes raise `.StreamClosedError`.
         """
-        if self.ws_connection is None:
+        if self.ws_connection is None or self.ws_connection.is_closing():
             raise WebSocketClosedError()
         if isinstance(message, dict):
             message = tornado.escape.json_encode(message)
@@ -356,7 +355,7 @@ class WebSocketHandler(tornado.web.RequestHandler):
 
         """
         data = utf8(data)
-        if self.ws_connection is None:
+        if self.ws_connection is None or self.ws_connection.is_closing():
             raise WebSocketClosedError()
         self.ws_connection.write_ping(data)
 
@@ -596,7 +595,8 @@ class _PerMessageDeflateCompressor(object):
 
 
 class _PerMessageDeflateDecompressor(object):
-    def __init__(self, persistent, max_wbits, compression_options=None):
+    def __init__(self, persistent, max_wbits, max_message_size, compression_options=None):
+        self._max_message_size = max_message_size
         if max_wbits is None:
             max_wbits = zlib.MAX_WBITS
         if not (8 <= max_wbits <= zlib.MAX_WBITS):
@@ -613,7 +613,10 @@ class _PerMessageDeflateDecompressor(object):
 
     def decompress(self, data):
         decompressor = self._decompressor or self._create_decompressor()
-        return decompressor.decompress(data + b'\x00\x00\xff\xff')
+        result = decompressor.decompress(data + b'\x00\x00\xff\xff', self._max_message_size)
+        if decompressor.unconsumed_tail:
+            raise _DecompressTooLargeError()
+        return result
 
 
 class WebSocketProtocol13(WebSocketProtocol):
@@ -801,6 +804,7 @@ class WebSocketProtocol13(WebSocketProtocol):
         self._compressor = _PerMessageDeflateCompressor(
             **self._get_compressor_options(side, agreed_parameters, compression_options))
         self._decompressor = _PerMessageDeflateDecompressor(
+            max_message_size=self.handler.max_message_size,
             **self._get_compressor_options(other_side, agreed_parameters, compression_options))
 
     def _write_frame(self, fin, opcode, data, flags=0):
@@ -920,7 +924,7 @@ class WebSocketProtocol13(WebSocketProtocol):
         new_len = payloadlen
         if self._fragmented_message_buffer is not None:
             new_len += len(self._fragmented_message_buffer)
-        if new_len > (self.handler.max_message_size or 10 * 1024 * 1024):
+        if new_len > self.handler.max_message_size:
             self.close(1009, "message too big")
             self._abort()
             return
@@ -971,7 +975,12 @@ class WebSocketProtocol13(WebSocketProtocol):
             return
 
         if self._frame_compressed:
-            data = self._decompressor.decompress(data)
+            try:
+                data = self._decompressor.decompress(data)
+            except _DecompressTooLargeError:
+                self.close(1009, "message too big after decompression")
+                self._abort()
+                return
 
         if opcode == 0x1:
             # UTF-8 data
@@ -1037,6 +1046,17 @@ class WebSocketProtocol13(WebSocketProtocol):
             self._waiting = self.stream.io_loop.add_timeout(
                 self.stream.io_loop.time() + 5, self._abort)
 
+    def is_closing(self):
+        """Return true if this connection is closing.
+
+        The connection is considered closing if either side has
+        initiated its closing handshake or if the stream has been
+        shut down uncleanly.
+        """
+        return (self.stream.closed() or
+                self.client_terminated or
+                self.server_terminated)
+
     @property
     def ping_interval(self):
         interval = self.handler.ping_interval
@@ -1064,7 +1084,7 @@ class WebSocketProtocol13(WebSocketProtocol):
 
         Called periodically if the websocket_ping_interval is set and non-zero.
         """
-        if self.stream.closed() and self.ping_callback is not None:
+        if self.is_closing() and self.ping_callback is not None:
             self.ping_callback.stop()
             return
 
@@ -1260,7 +1280,7 @@ class WebSocketClientConnection(simple_httpclient._HTTPConnection):
 def websocket_connect(url, callback=None, connect_timeout=None,
                       on_message_callback=None, compression_options=None,
                       ping_interval=None, ping_timeout=None,
-                      max_message_size=None, subprotocols=None):
+                      max_message_size=_default_max_message_size, subprotocols=None):
     """Client-side websocket support.
 
     Takes a url and returns a Future whose result is a
